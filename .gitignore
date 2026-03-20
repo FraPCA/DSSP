@@ -1,0 +1,11 @@
+/.benchmarks
+/.pytest_cache
+/.venv
+/benchmark_results_removed.json
+/Bibliografia
+/classicsecrets.py
+/clear.txt
+/client.py
+/multiusersecretsharing.zip
+/Tesi
+/__pycache__

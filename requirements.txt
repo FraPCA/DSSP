@@ -1,0 +1,10 @@
+pycryptodome
+binascii
+numpy
+itertools
+networkx
+matplotlib
+pydot
+graphviz
+pytest
+pytest-benchmark
