@@ -22,11 +22,7 @@ class DSSPEdge:
 
     def __str__(self):
         return f"Edge({self.i.value}<->{self.j.value})"
-
-    """def convertToNetworkXEdge(self):
-        return [self.i.value, self.j.value]"""
-
-
+    
 class DSSPGraph:
     def __init__(self):
         self.nodes: dict[int, "DSSPNode"] = {}
@@ -115,25 +111,24 @@ class DSSPGraph:
         sub.shares = self.shares
 
         return sub
+    
+    def initializeLeaves(self):
+    # O(|E|)
 
-    """def visualize(self):
+     for edge in self.edges:
+        if edge.j.getDegree() == 1:
+            self.shares[edge.j.value][0] = (self.secrets[edge.i.value, edge.j.value])      
+            # Dovrebbe corrispondere a sij allo step 0.
+        # Altrimenti rimane empty assegnato al nodo i
+    
+    def reduce(self):
+    # O(|E| * deg)
+     edges_to_remove = {edge for edge in self.edges if edge.j.getDegree() == 1}
 
-        edgeList = list()
-        for edge in self.edges:
-            edgeList.append(edge.convertToNetworkXEdge())
-        graph = networkx.Graph()
-        graph.add_edges_from(edgeList)
-        #print(graph)
-        pos = networkx.spring_layout(graph)
-        networkx.draw(graph, pos)
-        edge_labels = networkx.get_edge_attributes(graph, 'weight')
-        networkx.draw_networkx_edge_labels(graph, pos, edge_labels=edge_labels)
-        #if networkx.is_tree(graph):
-        #    pos = networkx.drawing.nx_pydot.graphviz_layout(graph, prog="dot")
-        #    networkx.draw(graph, pos, with_labels=True)
-        #else:
-        #    networkx.draw(graph, with_labels=True)
-        pyplot.show()"""
+     for edge in edges_to_remove:
+        self.remove_edge(edge)
+
+
     
     def visualize(self, step, subtitle=""):
         title = "Step " + str(step)
@@ -203,22 +198,6 @@ def altGenerateGraph(
         graph.shares[node[0]] = [[] for _ in range(numSteps)]
     # print(graph)
     return graph
-
-
-
-def initializeLeaves(graph: DSSPGraph):
-    # O(|E|)
-
-    for edge in graph.edges:
-        if edge.j.getDegree() == 1:
-            graph.shares[edge.j.value][0] = (graph.secrets[edge.i.value, edge.j.value])      
-            # Dovrebbe corrispondere a sij allo step 0.
-        # Altrimenti rimane empty assegnato al nodo i
-
-
-    print("Completato step 0: assegnate leaves. Stampo grafo risultante")
-    print(graph)
-
 
 def cycleCheckWithDFS(
     node: DSSPNode,
@@ -301,14 +280,6 @@ def getReducedGraphBasedOnLen(graph: DSSPGraph, h: int):
     for edge in edges_to_remove:
         #print("EDGE DA RIMUOVERE: " + str(edge))
         graph.remove_edge(edge)
-
-def getReducedGraph(graph: DSSPGraph):
-    # O(|E| * deg)
-    edges_to_remove = {edge for edge in graph.edges if edge.j.getDegree() == 1}
-
-    for edge in edges_to_remove:
-        graph.remove_edge(edge)
-
 
 def runSubgraphProtocol(graph: DSSPGraph, step: int, Zq):
     # O(|V| + |E| + |secrets|)
@@ -460,11 +431,11 @@ def DSSP():
     # print(graph)
 
     # Step 0
-    initializeLeaves(graph)
+    graph.initializeLeaves()
     graph.visualize(0, "Leaves initialized")
     # print(graph)
     # Ottiene G'
-    getReducedGraph(graph)
+    graph.reduce()
     lMax = graph.calculateLMax()
     print("Calcolata lMax: " + str(lMax))
 
@@ -530,10 +501,10 @@ def DSSPTestable(m: int, secretsLengths: list[int], n: int, q: int, accessStruct
     # print(graph)
 
     # Step 0
-    initializeLeaves(graph)
+    graph.initializeLeaves
     # print(graph)
     # Ottiene G'
-    getReducedGraph(graph)
+    graph.reduce()
     lMax = graph.calculateLMax()
     print("Calcolata lMax: " + str(lMax))
 
