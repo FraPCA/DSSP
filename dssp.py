@@ -337,9 +337,12 @@ def runSubgraphProtocol(graph: DSSPGraph, step: int, Zq):
                 and edge.i in graphZ.nodes
                 and edge.j not in graphZ.nodes
             ):
-                #graphZ.add_edge(edge.i.value, edge.j.value, edge.secrets)
+                #Assign the share dshi + xi,j to node j
+                dshi = graph.shares[edge.i.value][step - 1][0]
                 graphZ.add_edge(edge.i.value, edge.j.value)
+                graph.shares[edge.j.value][step - 1] = [dshi + graph.secrets[(arbEdge.i.value, arbEdge.j.value)][step - 1]]
                 existsEdgeInDisjunct = True
+                print("DEBUG: edge case found")
                 break
 
     print("Terminata iterazione del SubgraphShareDistributionProtocol")
