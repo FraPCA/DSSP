@@ -91,6 +91,8 @@ class DSSPGraph:
         """Prende come input lista di valori dei nodi,
         restituisce il grafo che li contiene."""
         sub = DSSPGraph()
+        sub.secrets = {}
+        sub.shares = {}
         nodes = {}
 
         for v in node_values:
@@ -106,9 +108,12 @@ class DSSPGraph:
                 sub.edges.add(new_edge)
                 nodes[iValue].edges.add(new_edge)
                 nodes[jValue].edges.add(new_edge)
+                sub.secrets[iValue, jValue] = self.secrets[iValue, jValue]
+                sub.shares[iValue] = self.shares[iValue]
+                sub.shares[jValue] = self.shares[jValue]
 
-        sub.secrets = self.secrets
-        sub.shares = self.shares
+        #sub.secrets = self.secrets
+        #sub.shares = self.shares
 
         return sub
     
@@ -247,16 +252,22 @@ def getConnectedComponents(graph: DSSPGraph):
             component = set()
             depthFirstSearch(node, visited, component)
             subgraph = DSSPGraph()
+            subgraph.secrets = {}
+            subgraph.shares = {}
             # Ottimizzazione per evitare di visitare nuovamente archi
             visited_edges = set()
             for edge in graph.edges:
                 if edge not in visited_edges:
                     if edge.i.value in component and edge.j.value in component:
                         subgraph.add_edge(edge.i.value, edge.j.value)
+                        subgraph.secrets[edge.i.value, edge.j.value] = graph.secrets[edge.i.value, edge.j.value]
+                        subgraph.shares[edge.i.value] = graph.shares[edge.i.value]
+                        subgraph.shares[edge.j.value] = graph.shares[edge.j.value]
                     visited_edges.add(edge)
             
-            subgraph.secrets = graph.secrets
-            subgraph.shares = graph.shares
+
+            #subgraph.secrets = graph.secrets
+            #subgraph.shares = graph.shares
 
             components.append(subgraph)
     print("Stampo componenti")
@@ -289,26 +300,10 @@ def runSubgraphProtocol(graph: DSSPGraph, step: int, Zq):
     """ Parte da root siccome grafo è connesso,
     valore di parent è -1 in quanto non la root non ha parent."""
     if cycle:
-        print("Trovato ciclo")
-        # print(cycle)
         graphZ = graph.getSubset(cycle)
-        # print(graphZ)
-        # graphZ.visualize()
 
         # Applica cycle protocol
-
-        #Calcolo il subset di xij:
-        edge_keys = {
-        (edge.i.value, edge.j.value)
-        for edge in graphZ.edges
-        }
-
-        subset_secrets = {
-        k: v
-        for k, v in graph.secrets.items()
-        if k in edge_keys
-        }
-        cycleProtocol(graphZ, step, list(subset_secrets.values()))
+        cycleProtocol(graphZ, step, list(graphZ.secrets.values()))
         # print(graphZ)
 
     else:
