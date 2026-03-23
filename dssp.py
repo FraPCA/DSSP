@@ -64,13 +64,11 @@ class DSSPGraph:
         i = edge.i
         j = edge.j
 
-        # Rimosso controllo con if, fatto da discard.
+        i.edges.remove(edge)
 
-        i.edges.discard(edge)
+        j.edges.remove(edge)
 
-        j.edges.discard(edge)
-
-        self.edges.discard(edge)
+        self.edges.remove(edge)
 
         if not i.edges:
             # Equivalente a len(edges) == 0
