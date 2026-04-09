@@ -1,7 +1,5 @@
 pycryptodome
-binascii
 numpy
-itertools
 networkx
 matplotlib
 pydot
