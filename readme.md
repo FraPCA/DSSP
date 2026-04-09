@@ -24,5 +24,5 @@ Once these operations have been completed, the project can be executed by activa
 
 # Benchmarking
 <p>
-  To execute this project's associated local benchmarks, run the command: <em><strong>pytest dssp.py </strong></em>in an activated terminal window.
+  To execute this project's associated local benchmarks, run the command: <em><strong>pytest test_dssp.py </strong></em>in an activated terminal window.
 </p>
