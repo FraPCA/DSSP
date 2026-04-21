@@ -29,7 +29,7 @@ class DSSPGraph:
         self.edges: set[DSSPEdge] = set()
         self.secrets: dict[tuple[int, int], list[int]] #edge.i ed edge.j sono la key, i secret sono il value
         self.shares: dict[int, list[list[int]]] = {} #valore del nodo è la key, il value è una lista di liste di share, indicizzata per numero di step.
-
+        
     def __str__(self):
         nodes_str = ", ".join(str(node) for node in self.nodes.values())
         edges_str = ", ".join(str(edge) for edge in self.edges)
@@ -49,7 +49,7 @@ class DSSPGraph:
             self.nodes[value] = DSSPNode(value)
         return self.nodes[value]
 
-    def add_edge(self, iValue: int, jValue: int, secrets: list[int] = []):
+    def add_edge(self, iValue: int, jValue: int):
         i = self.get_node(iValue)
         j = self.get_node(jValue)
         edge = DSSPEdge(i, j)
@@ -91,6 +91,8 @@ class DSSPGraph:
         sub = DSSPGraph()
         sub.secrets = {}
         sub.shares = {}
+        tmpSecrets = {}
+        tmpShares = {}
         nodes = {}
 
         for v in node_values:
@@ -106,12 +108,12 @@ class DSSPGraph:
                 sub.edges.add(new_edge)
                 nodes[iValue].edges.add(new_edge)
                 nodes[jValue].edges.add(new_edge)
-                sub.secrets[iValue, jValue] = self.secrets[iValue, jValue]
-                sub.shares[iValue] = self.shares[iValue]
-                sub.shares[jValue] = self.shares[jValue]
+                tmpSecrets[(iValue, jValue)] = self.secrets[(iValue, jValue)]
+                tmpShares[iValue] = self.shares[iValue]
+                tmpShares[jValue] = self.shares[jValue]
 
-        #sub.secrets = self.secrets
-        #sub.shares = self.shares
+        sub.secrets = {k: self.secrets[k] for k in self.secrets if k in tmpSecrets}
+        sub.shares = {k: self.shares[k] for k in self.shares if k in tmpShares}
 
         return sub
     
@@ -158,8 +160,6 @@ class DSSPGraph:
 
         pyplot.show()
 
-
-
 def cycleProtocol(graph: DSSPGraph, h: int, secrets):
     # Assegna shares in grafo a ciclo
     # O(|secrets|)
@@ -177,14 +177,17 @@ def cycleProtocol(graph: DSSPGraph, h: int, secrets):
         sum = sum + secrets[i][h]
         # sum is now s1 + s2 + . . . + sm
     sharem = sum + secrets[m - 1][h]
-    graph.shares[m][h] = [sharem]
+
+    #Per lo stesso motivo, gli share vengono segnati da h + 1
+
+    graph.shares[m][h + 1] = [sharem]
     print("Inserito share in posizione: " + str(m))
     print(sharem)
     for i in range(m - 1, 0, -1):
         print("Inserisco share " + str(i))
-        sharei = graph.shares[i + 1][h][0] + secrets[i - 1][h]
+        sharei = graph.shares[i + 1][h + 1][0] + secrets[i - 1][h]
         print("Valore: " + str(sharei))
-        graph.shares[i][h] = [sharei]
+        graph.shares[i][h + 1] = [sharei]
     print("Stampo lista degli share:\n" + str(shares))
     return shares
 
@@ -195,7 +198,7 @@ def altGenerateGraph(
     graph = DSSPGraph()
     for edge in accessStructure:
         i, j = edge
-        graph.add_edge(i, j, secrets[(i,j)])
+        graph.add_edge(i, j)
     graph.secrets = secrets
     for node in graph.nodes.items():
         graph.shares[node[0]] = [[] for _ in range(numSteps)]
@@ -251,21 +254,23 @@ def getConnectedComponents(graph: DSSPGraph):
             depthFirstSearch(node, visited, component)
             subgraph = DSSPGraph()
             subgraph.secrets = {}
+            tmpSecrets = {}
             subgraph.shares = {}
+            tmpShares = {}
             # Ottimizzazione per evitare di visitare nuovamente archi
             visited_edges = set()
             for edge in graph.edges:
                 if edge not in visited_edges:
                     if edge.i.value in component and edge.j.value in component:
                         subgraph.add_edge(edge.i.value, edge.j.value)
-                        subgraph.secrets[edge.i.value, edge.j.value] = graph.secrets[edge.i.value, edge.j.value]
-                        subgraph.shares[edge.i.value] = graph.shares[edge.i.value]
-                        subgraph.shares[edge.j.value] = graph.shares[edge.j.value]
+                        tmpSecrets[(edge.i.value, edge.j.value)] = graph.secrets[(edge.i.value, edge.j.value)]
+                        tmpShares[edge.i.value] = graph.shares[edge.i.value]
+                        tmpShares[edge.j.value] = graph.shares[edge.j.value]
                     visited_edges.add(edge)
             
 
-            #subgraph.secrets = graph.secrets
-            #subgraph.shares = graph.shares
+            subgraph.secrets = {k: graph.secrets[k] for k in graph.secrets if k in tmpSecrets}
+            subgraph.shares = {k: graph.shares[k] for k in graph.shares if k in tmpShares}
 
             components.append(subgraph)
     print("Stampo componenti")
@@ -287,7 +292,6 @@ def getReducedGraphBasedOnLen(graph: DSSPGraph, h: int):
             edges_to_remove.append(edge)
 
     for edge in edges_to_remove:
-        #print("EDGE DA RIMUOVERE: " + str(edge))
         graph.remove_edge(edge)
 
 def runSubgraphProtocol(graph: DSSPGraph, step: int, Zq):
@@ -299,7 +303,6 @@ def runSubgraphProtocol(graph: DSSPGraph, step: int, Zq):
     valore di parent è -1 in quanto non la root non ha parent."""
     if cycle:
         graphZ = graph.getSubset(cycle)
-
         # Applica cycle protocol
         cycleProtocol(graphZ, step, list(graphZ.secrets.values()))
         # print(graphZ)
@@ -315,8 +318,8 @@ def runSubgraphProtocol(graph: DSSPGraph, step: int, Zq):
         shareR = random.choice(Zq)
         Zq.remove(shareR)
         print("Valore r scelto a caso: " + str(shareR))
-        graph.shares[arbEdge.i.value][step - 1] = [shareR]        
-        graph.shares[arbEdge.j.value][step - 1] = [shareR + graph.secrets[(arbEdge.i.value, arbEdge.j.value)][step - 1]]
+        graph.shares[arbEdge.i.value][step] = [shareR]        
+        graph.shares[arbEdge.j.value][step] = [shareR + graph.secrets[(arbEdge.i.value, arbEdge.j.value)][step - 1]]
         # print("Assegnati share ai nodi di un edge casuale")
         graphZ = graph.getSubset(set([arbEdge.i.value, arbEdge.j.value]))
         # print(graphZ)
@@ -331,9 +334,9 @@ def runSubgraphProtocol(graph: DSSPGraph, step: int, Zq):
                 and edge.j not in graphZ.nodes
             ):
                 #Assign the share dshi + xi,j to node j
-                dshi = graph.shares[edge.i.value][step - 1][0]
+                dshi = graph.shares[edge.i.value][step][0]
                 graphZ.add_edge(edge.i.value, edge.j.value)
-                graph.shares[edge.j.value][step - 1] = [dshi + graph.secrets[(arbEdge.i.value, arbEdge.j.value)][step - 1]]
+                graph.shares[edge.j.value][step] = [dshi + graph.secrets[(arbEdge.i.value, arbEdge.j.value)][step - 1]]
                 existsEdgeInDisjunct = True
                 print("DEBUG: edge case found")
                 break
@@ -341,6 +344,40 @@ def runSubgraphProtocol(graph: DSSPGraph, step: int, Zq):
     print("Terminata iterazione del SubgraphShareDistributionProtocol")
     print("Grafo risultante: " + str(graphZ))
     #graphZ.visualize()
+
+def reconstructSecret(shi: list[list[int]], shj: list[list[int]], lij: int, q:int):
+    secret = [0] * lij 
+    print(str(shi))
+    print(str(shj))
+    for h in range(1, lij + 1):
+        iValue = shi[h]
+        jValue = shj[h]
+        print("DEBUG: iValue: " + str(iValue) + ", Jvalue: " + str(jValue))
+        if iValue and jValue:
+            secret[h - 1] = (iValue[0] - jValue[0]) % q
+        else:
+            if not iValue:
+                secret[h - 1] = jValue[0]
+            else: #Jvalue empty
+                secret[h - 1] = iValue[0]
+        print("SecretH: " + str(secret[h - 1]))
+    print("Segreto ricostituito: " + str(secret))
+
+def reconstructAllSecrets(shares: dict[int, list[list[int]]], secrets: dict[tuple[int, int], list[int]], q: int):
+    for key in secrets:
+        iValue = key[0]
+        jValue = key[1]
+        originalSecret = secrets[key]
+        print("Valore del segreto originale:" + str(originalSecret))
+        
+        #per risolvere il problema del segreto assegnato allo step 0:
+        if not shares[iValue][0] and not shares[jValue][0]: 
+            reconstructSecret(shares[iValue], shares[jValue], len(originalSecret), q)
+        else:
+            if shares[iValue][0]:
+                print("Segreto ricostituito: " + str(shares[iValue][0]))
+            else:
+                print("Segreto ricostituito: " + str(shares[jValue][0]))
 
 
 def DSSPSetVariables(
@@ -368,8 +405,7 @@ def DSSPSetVariables(
         )
         secrets[tuple(edge)] = secret
 
-
-    numSteps = max(secretsLengths)
+    numSteps = max(secretsLengths) + 1 #Step 0 sono le leaves, quindi il totale è secretsLengths + 1
     graph = altGenerateGraph(accessStructure, secrets, numSteps)
     userShares = {}
 
@@ -422,7 +458,7 @@ def DSSP():
 
     graph, userShares, secrets, Zq = DSSPSetVariables(m, n, q, secretsLengths, accessStructure)
 
-    print("Segreti: " + str(secrets))
+    #print("Segreti: " + str(secrets))
 
     # print(graph)
 
@@ -439,14 +475,14 @@ def DSSP():
         print("Stampo il valore di h corrente: " + str(h + 1))
         getReducedGraphBasedOnLen(graph, h + 1)
         print("Grafo ridotto: " + str(graph))
-        graph.visualize(h, "Reduced Graph")
+        graph.visualize(h + 1, "Reduced Graph")
         connectedComponents = getConnectedComponents(graph)
         subtitleCounter = 1 # Usato per aggiungere contesto della componente connessa al grafo
         for j in connectedComponents:
             print("Subgraph generato: " + str(j))
-            j.visualize(h, "Connected Component # " + str(subtitleCounter))
+            j.visualize(h + 1, "Connected Component # " + str(subtitleCounter))
             runSubgraphProtocol(j, h + 1, Zq)  
-            j.visualize(h, "Connected Component # " + str(subtitleCounter) + " - After Subgraph Protocol")
+            j.visualize(h + 1, "Connected Component # " + str(subtitleCounter) + " - After Subgraph Protocol")
             subtitleCounter += 1
 
 
@@ -455,6 +491,9 @@ def DSSP():
     print("Segreti allocati: \n" + str(graph.secrets))
     print("Share allocati: \n" + str(graph.shares))
 
+   #print("DEBUG: Test segreto. Dovrebbe essere " + str(graph.secrets[(1,2)]))
+   # reconstructSecret(graph.shares[1], graph.shares[2], secretsLengths[0], q)
+    reconstructAllSecrets(graph.shares, graph.secrets, q)
 
 def checkCorrectInput(m: int, secretLengths: list[int], n: int, q: int):
     if m <= 0:
@@ -514,7 +553,6 @@ def DSSPTestable(m: int, secretsLengths: list[int], n: int, q: int, accessStruct
             runSubgraphProtocol(
                 j, h + 1, Zq
             )
-
     return 0
 
 
