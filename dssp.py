@@ -1,566 +1,624 @@
+"""
+Distributed Secret Sharing Protocol (DSSP) — single-field implementation.
+
+Implements the Different Secrets Size Protocol and the Subgraph Share
+Distribution Protocol of De Santis & Masucci, in the corrected version
+that handles connected components with arbitrary cyclomatic number
+(i.e. multiple independent cycles per component).
+
+The Subgraph Share Distribution Protocol proceeds in three phases:
+
+  1. Initialization
+     - If the component contains a cycle, apply the Cycle Protocol
+       to one cycle C, setting Z = (V_C, E_C).
+     - Otherwise (acyclic component), pick an arbitrary edge (i,j),
+       draw a uniform r in Z_q, and assign shares r and r + x_{i,j}
+       to nodes i and j. Set Z = ({i,j}, {(i,j)}).
+
+  2. Frontier expansion
+     - While there exists an edge (i,j) in E_J \\ E_Z with i in V_Z
+       and j not in V_Z: pick one of node i's existing shares dsh_i,
+       assign dsh_i + x_{i,j} to node j, then add j to V_Z and
+       (i,j) to E_Z.
+
+  3. Cycle closure
+     - While there exists an edge (i,j) in E_J \\ E_Z with both i
+       and j in V_Z: pick one of node i's existing shares dsh_i,
+       assign the *additional* share dsh_i + x_{i,j} to node j.
+       Then add (i,j) to E_Z.
+
+The Cycle Protocol is from De Prisco, De Santis & Palmieri (TDSC 2024).
+The frontier expansion and cycle closure phases are both applications of
+Construction 1 of the same paper.
+
+API preserved for backward compatibility with run_experiments.py:
+  - DSSP()             : interactive entry point
+  - DSSPTestable(...)  : non-interactive entry point, returns 0 on success
+  - DSSPSetVariables(...) : builds graph + secrets
+
+New API:
+  - run_dssp(access_structure, secrets, q) -> DSSPGraph
+        Runs the protocol and returns the graph with shares populated.
+  - reconstruct(graph, i, j, h, q) -> int
+        Reconstructs s_{i,j,h} (1-indexed). Returns the value.
+  - verify_all(graph, secrets, q) -> bool
+        Verifies that every secret can be reconstructed correctly.
+"""
+
 import random
-import matplotlib.pyplot as pyplot
-import networkx
+from collections import deque
+from typing import Optional
 
 
-class DSSPNode:
-    def __init__(self, value: int):
-        self.value = value
-        self.edges: set[DSSPEdge] = set()
+# ---------------------------------------------------------------------------
+# Graph data structures
+# ---------------------------------------------------------------------------
 
-    def getDegree(self):
-        return len(self.edges)
-
-    def __str__(self):
-        return f"Nodo {self.value}"
+def _ek(i: int, j: int) -> tuple:
+    """Canonical edge key (min, max)."""
+    return (min(i, j), max(i, j))
 
 
-class DSSPEdge:
-    def __init__(self, i: DSSPNode, j: DSSPNode):
-        self.i = i
-        self.j = j
-
-    def __str__(self):
-        return f"Edge({self.i.value}<->{self.j.value})"
-    
 class DSSPGraph:
+    """
+    Distributed Secret Sharing graph.
+
+    Attributes
+    ----------
+    nodes        : set[int]
+    edges        : set[tuple[int,int]]    -- canonical (min,max) keys
+    adj          : dict[int, set[int]]    -- adjacency as sets of neighbours
+    secrets      : dict[(i,j), list[int]] -- s_{i,j} as a list of length l_{i,j}
+    shares       : dict[v, list[list[int]]]
+                       shares[v][0] is the share at Step 0 (leaf init, possibly empty)
+                       shares[v][h] is the list of shares at step h (1..l_max).
+                       The list is empty if v received nothing at step h.
+                       It may contain MORE than one element if v received
+                       additional shares during cycle closure.
+    cycle_info   : dict[(i,j,h), (ordered_cycle, k)]
+                       reconstruction metadata for edges processed by the
+                       Cycle Protocol at step h: ordered_cycle is the list
+                       of nodes traversing the cycle, and k is the index
+                       of edge (i,j) along the cycle. Stored symmetrically
+                       for (i,j,h) and (j,i,h).
+    prop_from    : dict[(j,h), i]
+                       for an edge (i,j) assigned by frontier expansion at
+                       step h: j is the new endpoint, i is the existing one,
+                       and the single share of j at step h is dsh_i + x_{i,j}.
+    closure_share: dict[(i,j,h), (src, share_index, dst, dst_share_index)]
+                       for an edge (i,j) assigned by cycle closure at step h:
+                       src and dst identify which endpoint received the
+                       additional share, share_index points into shares[src][h]
+                       to identify the dsh_src used, dst_share_index points
+                       into shares[dst][h] to identify the new additional share.
+    """
+
     def __init__(self):
-        self.nodes: dict[int, "DSSPNode"] = {}
-        self.edges: set[DSSPEdge] = set()
-        self.secrets: dict[tuple[int, int], list[int]] #edge.i ed edge.j sono la key, i secret sono il value
-        self.shares: dict[int, list[list[int]]] = {} #valore del nodo è la key, il value è una lista di liste di share, indicizzata per numero di step.
-        
-    def __str__(self):
-        nodes_str = ", ".join(str(node) for node in self.nodes.values())
-        edges_str = ", ".join(str(edge) for edge in self.edges)
-        secrets_str = str(self.secrets)
-        shares_str = []
-        for node, values in self.shares.items():
-            shares_str.append(f"node {node}: ")
-            stepCounter = 0
-            for value in values:
-                shares_str.append(f"step {stepCounter} : {value} ,")
-                stepCounter += 1
-        return f"DSSPGraph(nodes=[{nodes_str}], edges=[{edges_str}], secrets=[{secrets_str}], shares=[{shares_str}])"
+        self.nodes: set = set()
+        self.edges: set = set()
+        self.adj: dict = {}                # v -> set of neighbours
+        self.secrets: dict = {}            # (i,j) -> list[int]
+        self.shares: dict = {}             # v -> list of lists; shares[v][h] = list[int]
+        self.cycle_info: dict = {}         # (i,j,h) -> (ordered, k)
+        self.prop_from: dict = {}          # (j,h) -> i
+        self.closure_share: dict = {}      # (i,j,h) -> (src, src_idx, dst, dst_idx)
 
+    def __str__(self) -> str:
+            return "Nodes: " + str(self.nodes) + "\nEdges: " + str(self.edges) + "\nAdj: " + str(self.adj) + "\nSecrets: " + str(self.secrets) + "\nShares: " + str(self.shares) + "\nCycle_info: " + str(self.cycle_info) + "\nProp_from: " + str(self.prop_from) + "\nClosure_share: " + str(self.closure_share)
 
-    def get_node(self, value: int):
-        if value not in self.nodes:
-            self.nodes[value] = DSSPNode(value)
-        return self.nodes[value]
+    # --- construction --------------------------------------------------
 
-    def add_edge(self, iValue: int, jValue: int):
-        i = self.get_node(iValue)
-        j = self.get_node(jValue)
-        edge = DSSPEdge(i, j)
-        self.edges.add(edge)
-        i.edges.add(edge)
-        j.edges.add(edge)
+    def add_node(self, v: int) -> None:
+        if v not in self.nodes:
+            self.nodes.add(v)
+            self.adj[v] = set()
 
-    def remove_edge(self, edge: DSSPEdge):
+    def add_edge(self, i: int, j: int) -> None:
+        self.add_node(i)
+        self.add_node(j)
+        e = _ek(i, j)
+        if e not in self.edges:
+            self.edges.add(e)
+            self.adj[i].add(j)
+            self.adj[j].add(i)
 
-        # O(deg)
+    def remove_edge(self, e: tuple) -> None:
+        i, j = e
+        self.edges.discard(e)
+        self.adj[i].discard(j)
+        self.adj[j].discard(i)
+        # Nodes are kept even if isolated; only callers may drop them.
 
-        i = edge.i
-        j = edge.j
+    def degree(self, v: int) -> int:
+        return len(self.adj.get(v, ()))
 
-        i.edges.remove(edge)
+    def has_edge(self, i: int, j: int) -> bool:
+        return _ek(i, j) in self.edges
 
-        j.edges.remove(edge)
+    def secret_component(self, i: int, j: int, h: int) -> int:
+        """Component h (1-indexed) of secret s_{i,j}, or 0 if absent."""
+        sec = self.secrets.get(_ek(i, j), [])
+        return sec[h - 1] if 1 <= h <= len(sec) else 0
 
-        self.edges.remove(edge)
+    # --- subgraph view --------------------------------------------------
 
-        if not i.edges:
-            # Equivalente a len(edges) == 0
-            self.nodes.pop(i.value, None)
+    def subgraph(self, node_set: set) -> "DSSPGraph":
+        """
+        Return a new DSSPGraph that shares the same `secrets`, `shares`,
+        `cycle_info`, `prop_from`, and `closure_share` dicts as self, but
+        whose `nodes` / `edges` / `adj` are restricted to node_set.
 
-        if not j.edges:
-            self.nodes.pop(j.value, None)
-    
-    def calculateLMax(self):
-        # Versione corta che usa max, passando iterable e key.
-        return max((len(secret) for secret in self.secrets.values()), default=0)
-    
-    def getSecrets(self):
-        #O(1)
-        return self.secrets
-
-    def getSubset(self, node_values: set[int]):
-        """Prende come input lista di valori dei nodi,
-        restituisce il grafo che li contiene."""
+        The shared dicts mean: writes made by the subgraph (e.g. assigning
+        shares) are visible on the parent.
+        """
         sub = DSSPGraph()
-        sub.secrets = {}
-        sub.shares = {}
-        tmpSecrets = {}
-        tmpShares = {}
-        nodes = {}
+        sub.secrets = self.secrets
+        sub.shares = self.shares
+        sub.cycle_info = self.cycle_info
+        sub.prop_from = self.prop_from
+        sub.closure_share = self.closure_share
 
-        for v in node_values:
-            old = self.nodes[v]
-            nodes[v] = DSSPNode(old.value)
-            sub.nodes[v] = nodes[v]
-
-        for edge in self.edges:
-            if edge.i.value in node_values and edge.j.value in node_values:
-                iValue = edge.i.value
-                jValue = edge.j.value
-                new_edge = DSSPEdge(nodes[iValue], nodes[jValue])
-                sub.edges.add(new_edge)
-                nodes[iValue].edges.add(new_edge)
-                nodes[jValue].edges.add(new_edge)
-                tmpSecrets[(iValue, jValue)] = self.secrets[(iValue, jValue)]
-                tmpShares[iValue] = self.shares[iValue]
-                tmpShares[jValue] = self.shares[jValue]
-
-        sub.secrets = {k: self.secrets[k] for k in self.secrets if k in tmpSecrets}
-        sub.shares = {k: self.shares[k] for k in self.shares if k in tmpShares}
-
+        sub.nodes = set(node_set)
+        sub.adj = {v: set() for v in node_set}
+        for (i, j) in self.edges:
+            if i in node_set and j in node_set:
+                sub.edges.add((i, j))
+                sub.adj[i].add(j)
+                sub.adj[j].add(i)
         return sub
-    
-    def initializeLeaves(self):
-    # O(|E|)
-
-     for edge in self.edges:
-        if edge.j.getDegree() == 1:
-            self.shares[edge.j.value][0] = (self.secrets[edge.i.value, edge.j.value])      
-            # Dovrebbe corrispondere a sij allo step 0.
-        # Altrimenti rimane empty assegnato al nodo i
-    
-    def reduce(self):
-    # O(|E| * deg)
-     edges_to_remove = {edge for edge in self.edges if edge.j.getDegree() == 1}
-
-     for edge in edges_to_remove:
-        self.remove_edge(edge)
 
 
-    
-    def visualize(self, step, subtitle=""):
-        title = "Step " + str(step)
-        pyplot.suptitle(title)
-        pyplot.title(subtitle)
-        nxGraph = networkx.Graph()
-        for edge in self.edges:
-            nxGraph.add_edge(edge.i.value, edge.j.value, secret="s" + str(edge.i.value) + "," + str(edge.j.value) + "\n" + str(self.secrets[(edge.i.value, edge.j.value)]))
-        pos = networkx.shell_layout(nxGraph)
-        networkx.draw(nxGraph, pos, with_labels=True)
-        edge_labels = networkx.get_edge_attributes(nxGraph, 'secret')
-        networkx.draw_networkx_edge_labels(nxGraph, pos, edge_labels=edge_labels)
+# ---------------------------------------------------------------------------
+# Graph algorithms (deterministic)
+# ---------------------------------------------------------------------------
 
-        extra_labels = {n: "sh" + str(n) + "\n" + str(self.shares[n][step]) for n in nxGraph.nodes if n in self.shares}        
-        vertical_offset = 0.12  
+def find_cycle(graph: DSSPGraph) -> Optional[list]:
+    """
+    Iterative DFS cycle detection. Returns an *ordered* list of node values
+    that traverse a simple cycle, or None if the graph is acyclic.
+    Nodes are visited in sorted order for determinism.
+    """
+    if not graph.nodes:
+        return None
+    visited: set = set()
 
-        offset_pos = { node: (x, y + vertical_offset) for node, (x, y) in pos.items() }        
-        networkx.draw_networkx_labels(nxGraph,
-    offset_pos,
-    labels=extra_labels,
-    font_color="red",
-    font_size=10
-)
-
-        pyplot.show()
-
-def cycleProtocol(graph: DSSPGraph, h: int, secrets):
-    # Assegna shares in grafo a ciclo
-    # O(|secrets|)
-
-    h = h - 1  # H parte da 1, ma i segreti sono indicizzati da 0.
-    print("Valore h: " + str(h))
-
-    print(secrets)
-    sum = 0
-    m = len(secrets)
-    shares = [int] * len(secrets)
-    for i in range(m):
-        # parte da 0 per via dell'indicizzazione degli array su python
-        print("Calcolo somma per il segreto " + str(i))
-        sum = sum + secrets[i][h]
-        # sum is now s1 + s2 + . . . + sm
-    sharem = sum + secrets[m - 1][h]
-
-    #Per lo stesso motivo, gli share vengono segnati da h + 1
-
-    graph.shares[m][h + 1] = [sharem]
-    print("Inserito share in posizione: " + str(m))
-    print(sharem)
-    for i in range(m - 1, 0, -1):
-        print("Inserisco share " + str(i))
-        sharei = graph.shares[i + 1][h + 1][0] + secrets[i - 1][h]
-        print("Valore: " + str(sharei))
-        graph.shares[i][h + 1] = [sharei]
-    print("Stampo lista degli share:\n" + str(shares))
-    return shares
-
-def altGenerateGraph(
-        accessStructure, secrets: dict[tuple[int, int], list[int]], numSteps:int
-): # Crea grafo a partire da Access Structure e secrets
-
-    graph = DSSPGraph()
-    for edge in accessStructure:
-        i, j = edge
-        graph.add_edge(i, j)
-    graph.secrets = secrets
-    for node in graph.nodes.items():
-        graph.shares[node[0]] = [[] for _ in range(numSteps)]
-    # print(graph)
-    return graph
-
-def cycleCheckWithDFS(
-    node: DSSPNode,
-    parent: DSSPNode,
-    visited: set[int],
-    nodesInCycle: dict[int, DSSPNode],
-):
-    # O(|V| + |E|)
-    visited.add(node.value)
-    for edge in node.edges:
-        neighbor = edge.j if edge.i == node else edge.i
-        if neighbor.value not in visited:
-            nodesInCycle[neighbor.value] = node
-            cycle = cycleCheckWithDFS(neighbor, node, visited, nodesInCycle)
-            if cycle:
+    for start in sorted(graph.nodes):
+        if start in visited:
+            continue
+        # Iterative DFS keeping parent info to detect a back-edge
+        parent = {start: None}
+        # Stack contains (node, iterator over sorted neighbours)
+        stack = [(start, iter(sorted(graph.adj[start])))]
+        while stack:
+            v, it = stack[-1]
+            try:
+                nb = next(it)
+            except StopIteration:
+                stack.pop()
+                continue
+            if nb == parent[v]:
+                continue
+            if nb in parent:
+                # Back-edge v -> nb: reconstruct the cycle by walking up the
+                # parent chain from v back to nb, then reverse for correct order.
+                cycle = []
+                cur = v
+                while cur != nb:
+                    cycle.append(cur)
+                    cur = parent[cur]
+                cycle.append(nb)  # close the cycle back at the starting node
+                cycle.reverse()   # parent chain is built leaf-to-root; reverse it
                 return cycle
-        elif neighbor.value != parent.value:
-            # Individuato ciclo, va ripercorso
-            cycle = set()
-            cur = node
-            cycle.add(neighbor.value)
-            while cur.value != neighbor.value:
-                cycle.add(cur.value)
-                cur = nodesInCycle[cur.value]
+            parent[nb] = v
+            stack.append((nb, iter(sorted(graph.adj[nb]))))
+        visited.update(parent.keys())
+    return None
 
-            return cycle
+
+def connected_components(graph: DSSPGraph) -> list:
+    """Return list of subgraph views, one per connected component."""
+    visited: set = set()
+    comps = []
+    for start in sorted(graph.nodes):
+        if start in visited:
+            continue
+        comp: set = set()
+        stack = [start]
+        while stack:
+            v = stack.pop()
+            if v in visited:
+                continue
+            visited.add(v)
+            comp.add(v)
+            for nb in graph.adj[v]:
+                if nb not in visited:
+                    stack.append(nb)
+        comps.append(graph.subgraph(comp))
+    return comps
+
+
+def remove_short_edges(graph: DSSPGraph, h: int) -> None:
+    """Remove edges whose secret has fewer than h components."""
+    to_remove = [e for e in list(graph.edges)
+                 if len(graph.secrets.get(e, [])) < h]
+    for e in to_remove:
+        graph.remove_edge(e)
+    # Drop isolated nodes
+    for v in list(graph.nodes):
+        if not graph.adj.get(v):
+            graph.nodes.discard(v)
+            graph.adj.pop(v, None)
+
+
+# ---------------------------------------------------------------------------
+# Cycle Protocol (De Prisco, De Santis & Palmieri)
+# ---------------------------------------------------------------------------
+
+def apply_cycle_protocol(graph: DSSPGraph, cycle_ordered: list, h: int, q: int) -> None:
+    """
+    Cycle Protocol over Z_q at step h (1-indexed), on the ordered cycle.
+
+    Secrets are taken as x_k = s_{c_k, c_{k+1 mod m}, h} for k=0..m-1.
+    Shares are assigned as:
+        sh_{c_k} = (sum_all_secrets + sum_from_k) mod q
+    and stored as the (unique) share at step h for each cycle node.
+
+    Stores reconstruction metadata in graph.cycle_info[(c_k, c_{k+1}, h)].
+    """
+    m = len(cycle_ordered)
+    secs = [graph.secret_component(cycle_ordered[k],
+                                   cycle_ordered[(k + 1) % m], h)
+            for k in range(m)]
+    total = sum(secs) % q
+    for k in range(m):
+        suffix = sum(secs[k:]) % q
+        graph.shares[cycle_ordered[k]][h] = [(total + suffix) % q]
+    # Symmetric metadata
+    for k in range(m):
+        a, b = cycle_ordered[k], cycle_ordered[(k + 1) % m]
+        graph.cycle_info[(a, b, h)] = (cycle_ordered, k)
+        graph.cycle_info[(b, a, h)] = (cycle_ordered, k)
+
+
+# ---------------------------------------------------------------------------
+# Subgraph Share Distribution Protocol  (Algorithm 2, corrected version)
+# ---------------------------------------------------------------------------
+
+def run_subgraph_protocol(component: DSSPGraph, h: int, q: int) -> None:
+    """
+    Apply the Subgraph Share Distribution Protocol on a connected component
+    `component` at step h (1-indexed), with arithmetic in Z_q.
+
+    Three phases: initialization, frontier expansion, cycle closure.
+
+    `component` is a subgraph view: writes to its `shares`, `cycle_info`,
+    `prop_from`, `closure_share` are visible on the parent graph.
+    """
+    if not component.nodes or not component.edges:
+        return
+
+    # ---- Phase 1: initialization ----------------------------------------
+    VZ: set = set()
+    EZ: set = set()
+
+    cycle = find_cycle(component)
+    if cycle is not None:
+        apply_cycle_protocol(component, cycle, h, q)
+        VZ.update(cycle)
+        m = len(cycle)
+        for k in range(m):
+            EZ.add(_ek(cycle[k], cycle[(k + 1) % m]))
+    else:
+        # Acyclic component: pick an arbitrary edge (deterministic: minimum)
+        e0 = min(component.edges)
+        i0, j0 = e0
+        r = random.randrange(q)
+        x = component.secret_component(i0, j0, h)
+        component.shares[i0][h] = [r]
+        component.shares[j0][h] = [(r + x) % q]
+        component.prop_from[(j0, h)] = i0
+        VZ.update([i0, j0])
+        EZ.add(e0)
+
+    # ---- Phase 2: frontier expansion ------------------------------------
+    # BFS-style frontier queue: when a node joins V_Z, scan its incident
+    # edges and (a) propagate to neighbours not in V_Z (adding the new
+    # edge to E_Z), (b) record neighbours already in V_Z (with edge not
+    # yet in E_Z) as residual cycle-closure edges to be processed in
+    # Phase 3. This yields O(|V_J| + |E_J|) overall.
+    queue = deque(sorted(VZ))
+    residual_edges = []     # edges to be processed by cycle closure
+    seen_residual: set = set()
+    while queue:
+        src = queue.popleft()
+        for dst in sorted(component.adj.get(src, ())):
+            e = _ek(src, dst)
+            if e in EZ:
+                continue
+            if dst in VZ:
+                if e not in seen_residual:
+                    seen_residual.add(e)
+                    residual_edges.append(e)
+                continue
+            dsh_src = component.shares[src][h][0]
+            x = component.secret_component(src, dst, h)
+            component.shares[dst][h] = [(dsh_src + x) % q]
+            component.prop_from[(dst, h)] = src
+            VZ.add(dst)
+            EZ.add(e)
+            queue.append(dst)
+
+    # ---- Phase 3: cycle closure -----------------------------------------
+    # For every residual edge (i,j) in E_J \ E_Z (necessarily with i,j in V_Z),
+    # assign an *additional* share dsh_src + x_{src,dst} to node dst.
+    # Deterministic choice: src = min(i,j), dst = max(i,j).
+    for e in sorted(residual_edges):
+        i, j = e
+        src, dst = i, j  # i < j by construction
+        dsh_src = component.shares[src][h][0]
+        x = component.secret_component(src, dst, h)
+        new_share = (dsh_src + x) % q
+        component.shares[dst][h].append(new_share)
+        src_idx = 0
+        dst_idx = len(component.shares[dst][h]) - 1
+        component.closure_share[(src, dst, h)] = (src, src_idx, dst, dst_idx)
+        component.closure_share[(dst, src, h)] = (src, src_idx, dst, dst_idx)
+        EZ.add(e)
+
+
+# ---------------------------------------------------------------------------
+# Top-level: Different Secrets Size Protocol  (Algorithm 1)
+# ---------------------------------------------------------------------------
+
+def run_dssp(access_structure, secrets, q: int) -> DSSPGraph:
+    """
+    Run the Different Secrets Size Protocol over an access structure.
+
+    Parameters
+    ----------
+    access_structure : iterable of (i,j) pairs
+    secrets          : dict (i,j) -> list[int]   (component values in [0, q-1])
+                       Key (i,j) may also appear as (j,i); normalised internally.
+    q                : odd integer >= 3, the size of the finite field Z_q.
+
+    Returns
+    -------
+    A DSSPGraph with .shares populated.
+    """
+    # Normalise secret keys to canonical (min,max) form
+    norm_secrets = {_ek(i, j): list(v) for (i, j), v in secrets.items()}
+
+    # Build the graph
+    g = DSSPGraph()
+    for (i, j) in access_structure:
+        g.add_edge(i, j)
+    g.secrets = norm_secrets
+
+    if not g.edges:
+        return g
+
+    l_max = max(len(v) for v in norm_secrets.values())
+
+    # shares[v] has length l_max + 1; index 0 = Step 0; indices 1..l_max = step h
+    for v in g.nodes:
+        g.shares[v] = [[] for _ in range(l_max + 1)]
+
+    # --- Step 0: leaf initialisation ------------------------------------
+    # For every edge (i,j) such that at least one endpoint is a leaf,
+    # assign the whole secret to the leaf node, and nothing to the other.
+    # If both endpoints are leaves (an "isolated edge" component), the
+    # secret is deterministically assigned to the endpoint with the
+    # larger label.
+    leaves = {v for v in g.nodes if g.degree(v) == 1}
+    leaf_edges = []          # list of (leaf_node, edge_key) pairs
+    nodes_to_drop: set = set()
+    for e in list(g.edges):
+        i, j = e
+        i_is_leaf = (i in leaves)
+        j_is_leaf = (j in leaves)
+        if not (i_is_leaf or j_is_leaf):
+            continue
+        # Pick the leaf endpoint deterministically
+        if i_is_leaf and j_is_leaf:
+            leaf = max(i, j)
+        elif i_is_leaf:
+            leaf = i
+        else:
+            leaf = j
+        g.shares[leaf][0] = list(g.secrets.get(e, []))
+        leaf_edges.append((leaf, e))
+
+    # Remove the processed leaf edges, then drop nodes that become isolated.
+    for (_leaf, e) in leaf_edges:
+        g.remove_edge(e)
+    for v in list(g.nodes):
+        if not g.adj.get(v):
+            g.nodes.discard(v)
+            g.adj.pop(v, None)
+
+    # --- Steps 1 .. l_max ----------------------------------------------
+    for h in range(1, l_max + 1):
+        remove_short_edges(g, h)
+        for comp in connected_components(g):
+            run_subgraph_protocol(comp, h, q)
+
+    return g
+
+
+# ---------------------------------------------------------------------------
+# Reconstruction
+# ---------------------------------------------------------------------------
+
+def reconstruct(graph: DSSPGraph, i: int, j: int, h: int, q: int) -> Optional[int]:
+    """
+    Reconstruct the h-th component (1-indexed) of secret s_{i,j}.
+
+    Strategy:
+      - Leaf case: one endpoint received the entire secret at Step 0;
+        return component (h-1).
+      - Cycle Protocol case: edge processed by the Cycle Protocol at
+        step h. Use cycle_info to compute the value.
+      - Cycle closure case: edge processed during phase 3.
+        x = (additional_share_at_dst - dsh_src) mod q.
+      - Frontier expansion case: edge processed during phase 2.
+        x = (sh_dst - dsh_src) mod q.
+    """
+    # ---- Leaf case ----------------------------------------------------
+    sh_i_0 = graph.shares.get(i, [[]])[0]
+    sh_j_0 = graph.shares.get(j, [[]])[0]
+    if sh_i_0 and not sh_j_0:
+        idx = h - 1
+        return sh_i_0[idx] if 0 <= idx < len(sh_i_0) else None
+    if sh_j_0 and not sh_i_0:
+        idx = h - 1
+        return sh_j_0[idx] if 0 <= idx < len(sh_j_0) else None
+
+    # ---- Cycle Protocol case -----------------------------------------
+    info = graph.cycle_info.get((i, j, h)) or graph.cycle_info.get((j, i, h))
+    if info is not None:
+        ordered, k = info
+        m = len(ordered)
+        a, b = ordered[k], ordered[(k + 1) % m]
+        sh_a = graph.shares[a][h][0]
+        sh_b = graph.shares[b][h][0]
+        if k < m - 1:
+            return (sh_a - sh_b) % q
+        else:
+            inv2 = pow(2, -1, q)
+            return ((2 * sh_a - sh_b) * inv2) % q
+
+    # ---- Cycle closure case ------------------------------------------
+    cl = graph.closure_share.get((i, j, h)) or graph.closure_share.get((j, i, h))
+    if cl is not None:
+        src, src_idx, dst, dst_idx = cl
+        dsh_src = graph.shares[src][h][src_idx]
+        add_share = graph.shares[dst][h][dst_idx]
+        return (add_share - dsh_src) % q
+
+    # ---- Frontier expansion case --------------------------------------
+    src_of_j = graph.prop_from.get((j, h))
+    src_of_i = graph.prop_from.get((i, h))
+    sh_i_h = graph.shares.get(i, [])
+    sh_j_h = graph.shares.get(j, [])
+    if not (h < len(sh_i_h) and sh_i_h[h]):
+        return None
+    if not (h < len(sh_j_h) and sh_j_h[h]):
+        return None
+
+    if src_of_j == i:
+        return (sh_j_h[h][0] - sh_i_h[h][0]) % q
+    if src_of_i == j:
+        return (sh_i_h[h][0] - sh_j_h[h][0]) % q
 
     return None
 
 
-def depthFirstSearch(node: DSSPNode, visited: set[int], component: set[int]):
-    # O(|V| + |E|)
-    visited.add(node.value)
-    component.add(node.value)
-    for edge in node.edges:
-        neighbor = edge.j if edge.i == node else edge.i
-        if neighbor.value not in visited:
-            depthFirstSearch(neighbor, visited, component)
+def verify_all(graph: DSSPGraph, secrets: dict, q: int) -> bool:
+    """
+    Verify that every secret in `secrets` is correctly reconstructible.
+
+    `secrets` may use either (i,j) or (j,i) keys.
+    Returns True iff all reconstructions match.
+    """
+    norm = {_ek(i, j): list(v) for (i, j), v in secrets.items()}
+    for (i, j), sec in norm.items():
+        for h_idx, expected in enumerate(sec):
+            h = h_idx + 1
+            got = reconstruct(graph, i, j, h, q)
+            if got != expected:
+                return False
+    return True
 
 
-def getConnectedComponents(graph: DSSPGraph):
-    # O(|V| + |E|)
-    visited = set()
-    components = []
-    for node in graph.nodes.values():
-        if node.value not in visited:
-            component = set()
-            depthFirstSearch(node, visited, component)
-            subgraph = DSSPGraph()
-            subgraph.secrets = {}
-            tmpSecrets = {}
-            subgraph.shares = {}
-            tmpShares = {}
-            # Ottimizzazione per evitare di visitare nuovamente archi
-            visited_edges = set()
-            for edge in graph.edges:
-                if edge not in visited_edges:
-                    if edge.i.value in component and edge.j.value in component:
-                        subgraph.add_edge(edge.i.value, edge.j.value)
-                        tmpSecrets[(edge.i.value, edge.j.value)] = graph.secrets[(edge.i.value, edge.j.value)]
-                        tmpShares[edge.i.value] = graph.shares[edge.i.value]
-                        tmpShares[edge.j.value] = graph.shares[edge.j.value]
-                    visited_edges.add(edge)
-            
+# ---------------------------------------------------------------------------
+# Backward-compatible API
+# ---------------------------------------------------------------------------
 
-            subgraph.secrets = {k: graph.secrets[k] for k in graph.secrets if k in tmpSecrets}
-            subgraph.shares = {k: graph.shares[k] for k in graph.shares if k in tmpShares}
+def DSSPSetVariables(m: int, n: int, q: int,
+                     secretsLengths: list, accessStructure: list):
+    """
+    Build a graph + random secrets matching the supplied lengths.
 
-            components.append(subgraph)
-    print("Stampo componenti")
-    for component in components:
-        print(component)
+    Backward-compatible with the original signature; the `n` and `m`
+    parameters are kept for API compatibility but only used for input
+    validation in the interactive script.
+    """
+    if len(secretsLengths) != len(accessStructure):
+        raise ValueError("len(secretsLengths) must equal len(accessStructure)")
 
-    return components
+    secrets = {}
+    for idx, edge in enumerate(accessStructure):
+        i, j = edge[0], edge[1]
+        secrets[(i, j)] = [random.randrange(q)
+                           for _ in range(secretsLengths[idx])]
+    Zq = list(range(q))
+    return None, None, secrets, Zq
 
 
-def getReducedGraphBasedOnLen(graph: DSSPGraph, h: int):
-    # O(|E| * deg)
-    edges_to_remove = []
+def DSSPTestable(m: int, secretsLengths: list, n: int, q: int,
+                 accessStructure: list) -> int:
+    """
+    Non-interactive entry point used by the benchmarks. Builds random
+    secrets, runs the protocol, verifies the reconstruction, and returns
+    0 on success.
 
-    for edge in list(graph.edges):
-        key = (edge.i.value, edge.j.value)
-        #h - 1 siccome array parte da 0, h da 1
+    Returns a non-zero error code if the inputs are invalid or if
+    reconstruction fails.
+    """
+    err = _check_inputs(m, secretsLengths, n, q)
+    if err != 0:
+        return err
 
-        if len(graph.secrets[key]) < h:
-            edges_to_remove.append(edge)
-
-    for edge in edges_to_remove:
-        graph.remove_edge(edge)
-
-def runSubgraphProtocol(graph: DSSPGraph, step: int, Zq):
-    # O(|V| + |E| + |secrets|)
-    print("Entrato nel SubgraphShareDistributionProtocol")
-    # Controlla l'esistenza di un ciclo
-    cycle = cycleCheckWithDFS(graph.get_node(1), DSSPNode(-1), set(), {})
-    """ Parte da root siccome grafo è connesso,
-    valore di parent è -1 in quanto non la root non ha parent."""
-    if cycle:
-        graphZ = graph.getSubset(cycle)
-        # Applica cycle protocol
-        cycleProtocol(graphZ, step, list(graphZ.secrets.values()))
-        # print(graphZ)
-
-    else:
-        print("Nessun ciclo trovato")
-        # Applica caso else
-        # O(m), però non c'è modo diverso di farlo.
-        arbEdge = random.choice(list(graph.edges))
-        if len(Zq) < 1:
-            print("Errore, terminati valori usabili nel campo Zq.")
-            exit()
-        shareR = random.choice(Zq)
-        Zq.remove(shareR)
-        print("Valore r scelto a caso: " + str(shareR))
-        graph.shares[arbEdge.i.value][step] = [shareR]        
-        graph.shares[arbEdge.j.value][step] = [shareR + graph.secrets[(arbEdge.i.value, arbEdge.j.value)][step - 1]]
-        # print("Assegnati share ai nodi di un edge casuale")
-        graphZ = graph.getSubset(set([arbEdge.i.value, arbEdge.j.value]))
-        # print(graphZ)
-
-    existsEdgeInDisjunct = True
-    while existsEdgeInDisjunct:
-        existsEdgeInDisjunct = False
-        for edge in graph.edges:
-            if (
-                edge not in graphZ.edges
-                and edge.i in graphZ.nodes
-                and edge.j not in graphZ.nodes
-            ):
-                #Assign the share dshi + xi,j to node j
-                dshi = graph.shares[edge.i.value][step][0]
-                graphZ.add_edge(edge.i.value, edge.j.value)
-                graph.shares[edge.j.value][step] = [dshi + graph.secrets[(arbEdge.i.value, arbEdge.j.value)][step - 1]]
-                existsEdgeInDisjunct = True
-                print("DEBUG: edge case found")
-                break
-
-    print("Terminata iterazione del SubgraphShareDistributionProtocol")
-    print("Grafo risultante: " + str(graphZ))
-    #graphZ.visualize()
-
-def reconstructSecret(shi: list[list[int]], shj: list[list[int]], lij: int, q:int):
-    secret = [0] * lij 
-    print(str(shi))
-    print(str(shj))
-    for h in range(1, lij + 1):
-        iValue = shi[h]
-        jValue = shj[h]
-        print("DEBUG: iValue: " + str(iValue) + ", Jvalue: " + str(jValue))
-        if iValue and jValue:
-            secret[h - 1] = (iValue[0] - jValue[0]) % q
-        else:
-            if not iValue:
-                secret[h - 1] = jValue[0]
-            else: #Jvalue empty
-                secret[h - 1] = iValue[0]
-        print("SecretH: " + str(secret[h - 1]))
-    print("Segreto ricostituito: " + str(secret))
-
-def reconstructAllSecrets(shares: dict[int, list[list[int]]], secrets: dict[tuple[int, int], list[int]], q: int):
-    for key in secrets:
-        iValue = key[0]
-        jValue = key[1]
-        originalSecret = secrets[key]
-        print("Valore del segreto originale:" + str(originalSecret))
-        
-        #per risolvere il problema del segreto assegnato allo step 0:
-        if not shares[iValue][0] and not shares[jValue][0]: 
-            reconstructSecret(shares[iValue], shares[jValue], len(originalSecret), q)
-        else:
-            if shares[iValue][0]:
-                print("Segreto ricostituito: " + str(shares[iValue][0]))
-            else:
-                print("Segreto ricostituito: " + str(shares[jValue][0]))
-
-
-def DSSPSetVariables(
-    m: int, n: int, q: int, secretsLengths: list, accessStructure: list[list]
-):  # Imposta variabili per il grafo DSSP di tipo TDSC
-
-    secrets = dict() #key è edge, value sono i secret associati
-    Zq = list(range(1, q))
-
-    clientCounter = 0
-    for edge in accessStructure:
-        """Genera un segreto casualmente ed indipendentemente per ogni utente,
-        ed ottieni i suoi share."""
-        secret = list()
-        for _ in range(secretsLengths[clientCounter]):
-            choice = random.choice(Zq)
-            Zq.remove(choice)
-            secret.append(choice)
-        clientCounter = clientCounter + 1
-        print(
-            "Segreto generato casualmente per il client "
-            + str(clientCounter)
-            + ":"
-            + str(secret)
-        )
-        secrets[tuple(edge)] = secret
-
-    numSteps = max(secretsLengths) + 1 #Step 0 sono le leaves, quindi il totale è secretsLengths + 1
-    graph = altGenerateGraph(accessStructure, secrets, numSteps)
-    userShares = {}
-
-    return graph, userShares, secrets, Zq
-
-def DSSP():
-
-    m = int(input("Inserisci il numero di utenti\n"))
-    while m <= 0:
-        m = int(
-            input(
-                "Errore, il numero di utenti non può essere minore o uguale a"
-                " 0. Reinserirlo.\n"
-            )
-        )
-    secretsLengths = list()
-    sumOfSecretsLengths = 0
-    accessStructure = []
-    for secretNumber in range(m):
-        accessStructure.append(list(map(int, input("Inserire i numeri dei nodi che costituiscono l'arco numero " + str(secretNumber + 1) + ", separati da uno spazio\n").split())))
-        secretLen = int(
-            input("Inserisci lunghezza del segreto " + str(secretNumber + 1) + "\n")
-        )
-        while secretLen <= 0:
-            secretLen = int(
-                input(
-                    "Errore: lunghezza del segreto deve essere maggiore di"
-                    " 0. Reinserirla.\n"
-                )
-            )
-        secretsLengths.append(secretLen)
-        sumOfSecretsLengths += secretLen
-    n = int(input("Inserisci il numero di dischi\n"))
-    q = int(input("Inserisci il valore di q per il campo Zq\n"))
-    qValid = False
-    while not qValid:
-        if q >= 3 or q % 2 != 0:
-            if q > sumOfSecretsLengths:
-                qValid = True
-            else:
-                q = int(
-                    input(
-                        "Errore: lo spazio Zq non è abbastanza grande per la"
-                        "selezione dei segreti in base alle lunghezze "
-                        "impostate degli stessi. Reinserire q.\n"
-                    )
-                )
-        else:
-            q = int(input("Errore: q <= 3 e/o pari. Reinserire q.\n"))
-
-    graph, userShares, secrets, Zq = DSSPSetVariables(m, n, q, secretsLengths, accessStructure)
-
-    #print("Segreti: " + str(secrets))
-
-    # print(graph)
-
-    # Step 0
-    graph.initializeLeaves()
-    graph.visualize(0, "Leaves initialized")
-    # print(graph)
-    # Ottiene G'
-    graph.reduce()
-    lMax = graph.calculateLMax()
-    print("Calcolata lMax: " + str(lMax))
-
-    for h in range(lMax):  # H parte da 0, ma così si comporta come se fosse 1.
-        print("Stampo il valore di h corrente: " + str(h + 1))
-        getReducedGraphBasedOnLen(graph, h + 1)
-        print("Grafo ridotto: " + str(graph))
-        graph.visualize(h + 1, "Reduced Graph")
-        connectedComponents = getConnectedComponents(graph)
-        subtitleCounter = 1 # Usato per aggiungere contesto della componente connessa al grafo
-        for j in connectedComponents:
-            print("Subgraph generato: " + str(j))
-            j.visualize(h + 1, "Connected Component # " + str(subtitleCounter))
-            runSubgraphProtocol(j, h + 1, Zq)  
-            j.visualize(h + 1, "Connected Component # " + str(subtitleCounter) + " - After Subgraph Protocol")
-            subtitleCounter += 1
-
-
-    print("Terminata elaborazione del grafo secondo DSSP.")
-    #print("DEBUG: Grafo finale: ")
-    print("Segreti allocati: \n" + str(graph.secrets))
-    print("Share allocati: \n" + str(graph.shares))
-
-   #print("DEBUG: Test segreto. Dovrebbe essere " + str(graph.secrets[(1,2)]))
-   # reconstructSecret(graph.shares[1], graph.shares[2], secretsLengths[0], q)
-    reconstructAllSecrets(graph.shares, graph.secrets, q)
-
-def checkCorrectInput(m: int, secretLengths: list[int], n: int, q: int):
-    if m <= 0:
-        print("Errore, il numero di utenti non può essere <= di 0.")
-        return 1
-    sumOfSecretsLengths = 0
-    for length in secretLengths:
-
-        if length <= 0:
-            print(
-                "Errore, il segreto numero: "
-                + str(length + 1)
-                + "ha lunghezza >= di 0."
-            )
-            return 2
-        sumOfSecretsLengths += length
-    if n <= 0:
-        print("Errore, il numero di dischi non può essere <= di 0.")
-        return 3
-    if q >= 3 or q % 2 != 0:
-        if q <= sumOfSecretsLengths:
-            print(
-                "Errore: lo spazio Zq non è abbastanza grande per la"
-                "selezione dei segreti in base alle lunghezze "
-                "impostate degli stessi."
-            )
-            return 4
-        return 0 
-        #Input corretti
-    else:
-        print("Errore: q <= 3 e/o pari.")
-        return 5
-
-def DSSPTestable(m: int, secretsLengths: list[int], n: int, q: int, accessStructure: list[list]):
-    checkValue = checkCorrectInput(m, secretsLengths, n, q)
-    if checkValue != 0:
-        return checkValue
-    graph, userShares, secrets, Zq = DSSPSetVariables(m, n, q, secretsLengths, accessStructure)
-
-    # print(graph)
-
-    # Step 0
-    graph.initializeLeaves
-    # print(graph)
-    # Ottiene G'
-    graph.reduce()
-    lMax = graph.calculateLMax()
-    print("Calcolata lMax: " + str(lMax))
-
-    for h in range(lMax):  # H parte da 0, ma così si comporta come se fosse 1.
-        print("Stampo il valore di h corrente: " + str(h + 1))
-        getReducedGraphBasedOnLen(graph, h + 1)
-        print("Grafo ridotto: " + str(graph))
-        connectedComponents = getConnectedComponents(graph)
-        for j in connectedComponents:
-            print("Subgraph generato: " + str(j))
-            runSubgraphProtocol(
-                j, h + 1, Zq
-            )
+    _, _, secrets, _ = DSSPSetVariables(m, n, q, secretsLengths, accessStructure)
+    graph = run_dssp(accessStructure, secrets, q)
+    if not verify_all(graph, secrets, q):
+        return 99
     return 0
 
 
-def main():
-    DSSP()
+def _check_inputs(m: int, secretLengths: list, n: int, q: int) -> int:
+    if m <= 0:
+        return 1
+    for length in secretLengths:
+        if length <= 0:
+            return 2
+    if n <= 0:
+        return 3
+    if q < 3 or q % 2 == 0:
+        return 5
+    return 0
 
+
+def DSSP() -> None:
+    """Interactive entry point (kept for backward compatibility)."""
+    m = int(input("Inserisci il numero di utenti\n"))
+    secretsLengths = []
+    accessStructure = []
+    for k in range(m):
+        edge = list(map(int, input(
+            f"Inserire i due nodi dell'arco {k+1} separati da uno spazio\n"
+        ).split()))
+        accessStructure.append(edge)
+        secretsLengths.append(
+            int(input(f"Inserisci lunghezza del segreto {k+1}\n"))
+        )
+    n = int(input("Inserisci il numero di dischi\n"))
+    q = int(input("Inserisci il valore di q per il campo Zq\n"))
+
+    err = _check_inputs(m, secretsLengths, n, q)
+    if err != 0:
+        print(f"Errore di input (codice {err})")
+        return
+
+    _, _, secrets, _ = DSSPSetVariables(m, n, q, secretsLengths, accessStructure)
+    graph = run_dssp(accessStructure, secrets, q)
+    ok = verify_all(graph, secrets, q)
+    print(f"Reconstruction {'OK' if ok else 'FAILED'}.")
+
+
+# ---------------------------------------------------------------------------
+# Module entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    """Invoca la funzione main quando il programma
-    viene invocato da riga di comando."""
-    main()
+    DSSP()
