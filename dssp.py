@@ -46,6 +46,8 @@ New API:
 """
 
 import random
+import matplotlib.pyplot as pyplot
+import networkx
 from collections import deque
 from typing import Optional
 
@@ -166,6 +168,97 @@ class DSSPGraph:
                 sub.adj[i].add(j)
                 sub.adj[j].add(i)
         return sub
+    
+    # --- graphic representation of the graph during each step --------------------------------------------------
+
+    def visualize_step(self, step: int, subtitle: str) -> None:
+
+        """
+        This function is responsible for creating and updating a window which shows a visual representation of the
+        graph, during step `step`. Nodes, edges, secrets and shares are shown by the representation, which is
+        updated through clicks or key presses. 
+        `subtitle` is passed to this function in order to provide a title for the graph, which usually contextualizes
+        the most recent operation that was executed on it.
+        """
+
+
+        pyplot.clf()                          
+        ax = pyplot.gca()                     
+        fig = pyplot.gcf()                    
+        fig.patch.set_facecolor("#1a1a2e")
+        ax.set_facecolor("#1a1a2e")
+        
+        nxGraph = networkx.Graph()
+        nxGraph.add_nodes_from(self.nodes)
+        for edge in self.edges:
+            i, j = edge
+            history = self.secrets.get((i, j), [])
+            label = f"s{i},{j}\n{history}"
+            nxGraph.add_edge(i, j, secret=label)
+
+        pos = networkx.shell_layout(nxGraph)
+
+        networkx.draw_networkx_nodes(
+            nxGraph, pos, ax=ax,
+            node_color="#e94560",
+            node_size=800,
+            linewidths=2,
+            edgecolors="#ffffff",
+        )
+
+        networkx.draw_networkx_labels(
+            nxGraph, pos, ax=ax,
+            font_color="white",
+            font_size=11,
+            font_weight="bold",
+        )
+
+        networkx.draw_networkx_edges(
+            nxGraph, pos, ax=ax,
+            edge_color="#4a90d9",
+            width=2,
+            alpha=0.7,
+            style="solid",
+        )
+
+        edge_labels = networkx.get_edge_attributes(nxGraph, "secret")
+        networkx.draw_networkx_edge_labels(
+            nxGraph, pos, edge_labels=edge_labels, ax=ax,
+            font_color="#f0c040",
+            font_size=8,
+            bbox=dict(boxstyle="round,pad=0.3", fc="#16213e", ec="#4a90d9", alpha=0.85),
+        )
+
+        extra_labels = {
+            n: str([vals for h, vals in enumerate(self.shares[n]) if h <= step])
+            for n in nxGraph.nodes() if n in self.shares
+        }
+        vertical_offset = 0.15
+        offset_pos = {node: (x, y + vertical_offset) for node, (x, y) in pos.items()}
+        networkx.draw_networkx_labels(
+            nxGraph, offset_pos, labels=extra_labels, ax=ax,
+            font_color="#00e5ff",
+            font_size=9,
+            font_weight="bold",
+        )
+
+        fig.suptitle(
+            f"Step {step}",
+            color="white", fontsize=16, fontweight="bold", y=0.98,
+        )
+        ax.set_title(
+            subtitle,
+            color="#aaaacc", fontsize=11, pad=8,
+        )
+
+        ax.set_xlim(-1.5, 1.5)
+        ax.set_ylim(-1.5, 1.5)
+        ax.axis("off")
+
+        pyplot.tight_layout()
+        pyplot.draw()                  
+        pyplot.waitforbuttonpress() 
+        
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +389,7 @@ def run_subgraph_protocol(component: DSSPGraph, h: int, q: int) -> None:
     """
     if not component.nodes or not component.edges:
         return
-
+    
     # ---- Phase 1: initialization ----------------------------------------
     VZ: set = set()
     EZ: set = set()
@@ -308,6 +401,7 @@ def run_subgraph_protocol(component: DSSPGraph, h: int, q: int) -> None:
         m = len(cycle)
         for k in range(m):
             EZ.add(_ek(cycle[k], cycle[(k + 1) % m]))
+
     else:
         # Acyclic component: pick an arbitrary edge (deterministic: minimum)
         e0 = min(component.edges)
@@ -365,6 +459,98 @@ def run_subgraph_protocol(component: DSSPGraph, h: int, q: int) -> None:
         component.closure_share[(dst, src, h)] = (src, src_idx, dst, dst_idx)
         EZ.add(e)
 
+def run_subgraph_protocol_visual(component: DSSPGraph, h: int, q: int) -> None:
+    """
+    Apply the Subgraph Share Distribution Protocol on a connected component
+    `component` at step h (1-indexed), with arithmetic in Z_q.
+
+    Three phases: initialization, frontier expansion, cycle closure.
+    In this version, each phase shows the resulting graph visually.
+
+    `component` is a subgraph view: writes to its `shares`, `cycle_info`,
+    `prop_from`, `closure_share` are visible on the parent graph.
+    """
+    if not component.nodes or not component.edges:
+        return
+    
+    # ---- Phase 1: initialization ----------------------------------------
+    VZ: set = set()
+    EZ: set = set()
+
+    cycle = find_cycle(component)
+    if cycle is not None:
+        apply_cycle_protocol(component, cycle, h, q)
+        VZ.update(cycle)
+        m = len(cycle)
+        for k in range(m):
+            EZ.add(_ek(cycle[k], cycle[(k + 1) % m]))
+
+        component.visualize_step(h, "Subgraph Share Distribution Protocol: After Cycle Protocol")
+
+    else:
+        # Acyclic component: pick an arbitrary edge (deterministic: minimum)
+        e0 = min(component.edges)
+        i0, j0 = e0
+        r = random.randrange(q)
+        x = component.secret_component(i0, j0, h)
+        component.shares[i0][h] = [r]
+        component.shares[j0][h] = [(r + x) % q]
+        component.prop_from[(j0, h)] = i0
+        VZ.update([i0, j0])
+        EZ.add(e0)
+
+        component.visualize_step(h, "Subgraph Share Distribution Protocol: After arbitrary edge")
+
+
+    # ---- Phase 2: frontier expansion ------------------------------------
+    # BFS-style frontier queue: when a node joins V_Z, scan its incident
+    # edges and (a) propagate to neighbours not in V_Z (adding the new
+    # edge to E_Z), (b) record neighbours already in V_Z (with edge not
+    # yet in E_Z) as residual cycle-closure edges to be processed in
+    # Phase 3. This yields O(|V_J| + |E_J|) overall.
+    queue = deque(sorted(VZ))
+    residual_edges = []     # edges to be processed by cycle closure
+    seen_residual: set = set()
+    while queue:
+        src = queue.popleft()
+        for dst in sorted(component.adj.get(src, ())):
+            e = _ek(src, dst)
+            if e in EZ:
+                continue
+            if dst in VZ:
+                if e not in seen_residual:
+                    seen_residual.add(e)
+                    residual_edges.append(e)
+                continue
+            dsh_src = component.shares[src][h][0]
+            x = component.secret_component(src, dst, h)
+            component.shares[dst][h] = [(dsh_src + x) % q]
+            component.prop_from[(dst, h)] = src
+            VZ.add(dst)
+            EZ.add(e)
+            queue.append(dst)
+
+    component.visualize_step(h, "Subgraph Share Distribution Protocol: After frontier expansion")
+
+
+    # ---- Phase 3: cycle closure -----------------------------------------
+    # For every residual edge (i,j) in E_J \ E_Z (necessarily with i,j in V_Z),
+    # assign an *additional* share dsh_src + x_{src,dst} to node dst.
+    # Deterministic choice: src = min(i,j), dst = max(i,j).
+    for e in sorted(residual_edges):
+        i, j = e
+        src, dst = i, j  # i < j by construction
+        dsh_src = component.shares[src][h][0]
+        x = component.secret_component(src, dst, h)
+        new_share = (dsh_src + x) % q
+        component.shares[dst][h].append(new_share)
+        src_idx = 0
+        dst_idx = len(component.shares[dst][h]) - 1
+        component.closure_share[(src, dst, h)] = (src, src_idx, dst, dst_idx)
+        component.closure_share[(dst, src, h)] = (src, src_idx, dst, dst_idx)
+        EZ.add(e)
+
+    component.visualize_step(h, "Subgraph Share Distribution Protocol: After cycle closure")
 
 # ---------------------------------------------------------------------------
 # Top-level: Different Secrets Size Protocol  (Algorithm 1)
@@ -385,6 +571,7 @@ def run_dssp(access_structure, secrets, q: int) -> DSSPGraph:
     -------
     A DSSPGraph with .shares populated.
     """
+
     # Normalise secret keys to canonical (min,max) form
     norm_secrets = {_ek(i, j): list(v) for (i, j), v in secrets.items()}
 
@@ -411,7 +598,6 @@ def run_dssp(access_structure, secrets, q: int) -> DSSPGraph:
     # larger label.
     leaves = {v for v in g.nodes if g.degree(v) == 1}
     leaf_edges = []          # list of (leaf_node, edge_key) pairs
-    nodes_to_drop: set = set()
     for e in list(g.edges):
         i, j = e
         i_is_leaf = (i in leaves)
@@ -443,6 +629,95 @@ def run_dssp(access_structure, secrets, q: int) -> DSSPGraph:
             run_subgraph_protocol(comp, h, q)
 
     return g
+
+def run_dssp_visual(access_structure, secrets, q: int) -> DSSPGraph:
+    """
+    Run the Different Secrets Size Protocol over an access structure, generating a clickable window that shows the state of the graph at each step.
+
+    Parameters
+    ----------
+    access_structure : iterable of (i,j) pairs
+    secrets          : dict (i,j) -> list[int]   (component values in [0, q-1])
+                       Key (i,j) may also appear as (j,i); normalised internally.
+    q                : odd integer >= 3, the size of the finite field Z_q.
+
+    Returns
+    -------
+    A DSSPGraph with .shares populated.
+    """
+
+    # Centers the window before generating it for the first time, in a rendering backend-agnostic way (Tk, QT, etc.)
+    manager = pyplot.get_current_fig_manager()
+    if manager is not None:
+        manager.resize(800, 600)
+
+    # Normalise secret keys to canonical (min,max) form
+    norm_secrets = {_ek(i, j): list(v) for (i, j), v in secrets.items()}
+
+    # Build the graph
+    g = DSSPGraph()
+    for (i, j) in access_structure:
+        g.add_edge(i, j)
+    g.secrets = norm_secrets
+
+    if not g.edges:
+        return g
+
+    l_max = max(len(v) for v in norm_secrets.values())
+
+    # shares[v] has length l_max + 1; index 0 = Step 0; indices 1..l_max = step h
+    for v in g.nodes:
+        g.shares[v] = [[] for _ in range(l_max + 1)]
+
+    # --- Step 0: leaf initialisation ------------------------------------
+    # For every edge (i,j) such that at least one endpoint is a leaf,
+    # assign the whole secret to the leaf node, and nothing to the other.
+    # If both endpoints are leaves (an "isolated edge" component), the
+    # secret is deterministically assigned to the endpoint with the
+    # larger label.
+    leaves = {v for v in g.nodes if g.degree(v) == 1}
+    leaf_edges = []          # list of (leaf_node, edge_key) pairs
+    for e in list(g.edges):
+        i, j = e
+        i_is_leaf = (i in leaves)
+        j_is_leaf = (j in leaves)
+        if not (i_is_leaf or j_is_leaf):
+            continue
+        # Pick the leaf endpoint deterministically
+        if i_is_leaf and j_is_leaf:
+            leaf = max(i, j)
+        elif i_is_leaf:
+            leaf = i
+        else:
+            leaf = j
+        g.shares[leaf][0] = list(g.secrets.get(e, []))
+        leaf_edges.append((leaf, e))
+
+    g.visualize_step(0, "Leaves initialized")
+
+    # Remove the processed leaf edges, then drop nodes that become isolated.
+    for (_leaf, e) in leaf_edges:
+        g.remove_edge(e)
+    for v in list(g.nodes):
+        if not g.adj.get(v):
+            g.nodes.discard(v)
+            g.adj.pop(v, None)
+
+    g.visualize_step(0, "Reduced graph")
+
+
+    # --- Steps 1 .. l_max ----------------------------------------------
+    for h in range(1, l_max + 1):
+        remove_short_edges(g, h)
+        g.visualize_step(h, "Subgraph built")
+        comp_counter = 0
+        for comp in connected_components(g):
+            comp_counter += 1
+            comp.visualize_step(h, "Connected component " + str(comp_counter))
+            run_subgraph_protocol_visual(comp, h, q)
+
+    return g
+
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +830,7 @@ def DSSPSetVariables(m: int, n: int, q: int,
     return None, None, secrets, Zq
 
 
-def DSSPTestable(m: int, secretsLengths: list, n: int, q: int,
+def DSSPTestable(should_show: str, m: int, secretsLengths: list, n: int, q: int,
                  accessStructure: list) -> int:
     """
     Non-interactive entry point used by the benchmarks. Builds random
@@ -565,7 +840,7 @@ def DSSPTestable(m: int, secretsLengths: list, n: int, q: int,
     Returns a non-zero error code if the inputs are invalid or if
     reconstruction fails.
     """
-    err = _check_inputs(m, secretsLengths, n, q)
+    err = _check_inputs(should_show, m, secretsLengths, n, q)
     if err != 0:
         return err
 
@@ -576,42 +851,48 @@ def DSSPTestable(m: int, secretsLengths: list, n: int, q: int,
     return 0
 
 
-def _check_inputs(m: int, secretLengths: list, n: int, q: int) -> int:
-    if m <= 0:
+def _check_inputs(should_show: str, m: int, secretLengths: list, n: int, q: int) -> int:
+    if should_show not in ("Y", "y", "N", "n"):
         return 1
+    if m <= 0:
+        return 2
     for length in secretLengths:
         if length <= 0:
-            return 2
+            return 3
     if n <= 0:
-        return 3
+        return 4
     if q < 3 or q % 2 == 0:
-        return 5
+        return 6
     return 0
 
 
 def DSSP() -> None:
     """Interactive entry point (kept for backward compatibility)."""
-    m = int(input("Inserisci il numero di utenti\n"))
+    should_show = str(input("Should the generated graphs be shown visually, with user interaction? This will result in a slight performance hit. (Y, N)\n"))
+    m = int(input("Please input the number of users\n"))
     secretsLengths = []
     accessStructure = []
     for k in range(m):
         edge = list(map(int, input(
-            f"Inserire i due nodi dell'arco {k+1} separati da uno spazio\n"
+            f"Please input the two nodes that constitute the edge {k+1}, with a space separating them\n"
         ).split()))
         accessStructure.append(edge)
         secretsLengths.append(
-            int(input(f"Inserisci lunghezza del segreto {k+1}\n"))
+            int(input(f"Please input the length of secret {k+1}\n"))
         )
-    n = int(input("Inserisci il numero di dischi\n"))
-    q = int(input("Inserisci il valore di q per il campo Zq\n"))
+    n = int(input("Please input the number of disks\n"))
+    q = int(input("Please input the value of q for the field Zq\n"))
 
-    err = _check_inputs(m, secretsLengths, n, q)
+    err = _check_inputs(should_show, m, secretsLengths, n, q)
     if err != 0:
-        print(f"Errore di input (codice {err})")
+        print(f"Input error (code {err})")
         return
 
     _, _, secrets, _ = DSSPSetVariables(m, n, q, secretsLengths, accessStructure)
-    graph = run_dssp(accessStructure, secrets, q)
+    if should_show in ("Y", "y"):
+        graph = run_dssp_visual(accessStructure, secrets, q)
+    else:
+        graph = run_dssp(accessStructure, secrets, q)
     ok = verify_all(graph, secrets, q)
     print(f"Reconstruction {'OK' if ok else 'FAILED'}.")
 

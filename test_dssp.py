@@ -24,7 +24,7 @@ gc.disable()
 
 def test_benchmark_DSSPTestable_1(benchmark):
     result = benchmark(
-        DSSPTestable, 5, [2, 3, 2, 3, 2], 5, 21,
+        DSSPTestable, "N", 5, [2, 3, 2, 3, 2], 5, 21,
         [[1, 2], [2, 3], [3, 4], [1, 4], [4, 5]],
     )
     assert result == 0
