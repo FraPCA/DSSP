@@ -6,3 +6,4 @@ pydot
 graphviz
 pytest
 pytest-benchmark
+scipy

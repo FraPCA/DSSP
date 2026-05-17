@@ -196,7 +196,7 @@ class DSSPGraph:
             label = f"s{i},{j}\n{history}"
             nxGraph.add_edge(i, j, secret=label)
 
-        pos = networkx.shell_layout(nxGraph)
+        pos = networkx.kamada_kawai_layout(nxGraph)
 
         networkx.draw_networkx_nodes(
             nxGraph, pos, ax=ax,
